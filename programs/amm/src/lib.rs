@@ -29,6 +29,7 @@ pub mod amm {
         pool.bump = *ctx.bumps.get("pool").ok_or(AmmError::MissingBump)?;
         pool.fee_bps = FEE_BPS;
         pool.protocol_fee_bps = PROTOCOL_FEE_BPS;
+        pool.paused = false;
 
         emit!(InitializeEvent {
             pool: pool.key(),
@@ -42,6 +43,7 @@ pub mod amm {
             fee_bps: pool.fee_bps,
             protocol_fee_bps: pool.protocol_fee_bps,
             admin: pool.admin,
+            paused: pool.paused,
         });
         Ok(())
     }
@@ -52,6 +54,7 @@ pub mod amm {
         amount_b: u64,
         min_lp_out: u64,
     ) -> Result<()> {
+        require!(!ctx.accounts.pool.paused, AmmError::PoolPaused);
         require!(amount_a > 0 && amount_b > 0, AmmError::InvalidAmount);
 
         let reserve_a = ctx.accounts.vault_a.amount;
@@ -173,6 +176,7 @@ pub mod amm {
         min_amount_out: u64,
         direction: SwapDirection,
     ) -> Result<()> {
+        require!(!ctx.accounts.pool.paused, AmmError::PoolPaused);
         require!(amount_in > 0, AmmError::InvalidAmount);
 
         let (reserve_in, reserve_out) = match direction {
@@ -185,10 +189,6 @@ pub mod amm {
         let protocol_fee_bps = ctx.accounts.pool.protocol_fee_bps;
         require!(protocol_fee_bps <= fee_bps, AmmError::InvalidFee);
 
-        let amount_out = quote_swap_out(amount_in, reserve_in, reserve_out, fee_bps)?;
-        require!(amount_out >= min_amount_out, AmmError::SlippageExceeded);
-        require!(amount_out < reserve_out, AmmError::InsufficientLiquidity);
-
         let protocol_fee = (amount_in as u128)
             .checked_mul(protocol_fee_bps as u128)
             .ok_or(AmmError::MathOverflow)?
@@ -197,6 +197,13 @@ pub mod amm {
         let amount_in_to_pool = amount_in
             .checked_sub(protocol_fee)
             .ok_or(AmmError::MathOverflow)?;
+        let lp_fee_bps = fee_bps
+            .checked_sub(protocol_fee_bps)
+            .ok_or(AmmError::MathOverflow)?;
+
+        let amount_out = quote_swap_out(amount_in_to_pool, reserve_in, reserve_out, lp_fee_bps)?;
+        require!(amount_out >= min_amount_out, AmmError::SlippageExceeded);
+        require!(amount_out < reserve_out, AmmError::InsufficientLiquidity);
 
         match direction {
             SwapDirection::AtoB => {
@@ -298,6 +305,31 @@ pub mod amm {
             pool: ctx.accounts.pool.key(),
             amount_a,
             amount_b,
+        });
+
+        Ok(())
+    }
+
+    pub fn set_pause(ctx: Context<SetPause>, paused: bool) -> Result<()> {
+        ctx.accounts.pool.paused = paused;
+
+        emit!(PauseEvent {
+            admin: ctx.accounts.admin.key(),
+            pool: ctx.accounts.pool.key(),
+            paused,
+        });
+
+        Ok(())
+    }
+
+    pub fn set_admin(ctx: Context<SetAdmin>) -> Result<()> {
+        let old_admin = ctx.accounts.pool.admin;
+        ctx.accounts.pool.admin = ctx.accounts.new_admin.key();
+
+        emit!(AdminUpdatedEvent {
+            pool: ctx.accounts.pool.key(),
+            old_admin,
+            new_admin: ctx.accounts.new_admin.key(),
         });
 
         Ok(())
@@ -616,6 +648,26 @@ pub struct WithdrawProtocolFees<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+#[derive(Accounts)]
+pub struct SetPause<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(mut, constraint = pool.admin == admin.key())]
+    pub pool: Account<'info, Pool>,
+}
+
+#[derive(Accounts)]
+pub struct SetAdmin<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    pub new_admin: Signer<'info>,
+
+    #[account(mut, constraint = pool.admin == admin.key())]
+    pub pool: Account<'info, Pool>,
+}
+
 #[account]
 pub struct Pool {
     pub mint_a: Pubkey,
@@ -629,10 +681,11 @@ pub struct Pool {
     pub bump: u8,
     pub fee_bps: u16,
     pub protocol_fee_bps: u16,
+    pub paused: bool,
 }
 
 impl Pool {
-    pub const LEN: usize = 8 + 32 * 8 + 1 + 2 + 2;
+    pub const LEN: usize = 8 + 32 * 8 + 1 + 2 + 2 + 1;
 
     pub fn signer_seeds(&self) -> [&[u8]; 4] {
         [
@@ -663,6 +716,7 @@ pub struct InitializeEvent {
     pub fee_bps: u16,
     pub protocol_fee_bps: u16,
     pub admin: Pubkey,
+    pub paused: bool,
 }
 
 #[event]
@@ -699,6 +753,20 @@ pub struct ProtocolFeeWithdrawEvent {
     pub pool: Pubkey,
     pub amount_a: u64,
     pub amount_b: u64,
+}
+
+#[event]
+pub struct PauseEvent {
+    pub admin: Pubkey,
+    pub pool: Pubkey,
+    pub paused: bool,
+}
+
+#[event]
+pub struct AdminUpdatedEvent {
+    pub pool: Pubkey,
+    pub old_admin: Pubkey,
+    pub new_admin: Pubkey,
 }
 
 impl<'info> DepositLiquidity<'info> {
@@ -915,4 +983,6 @@ pub enum AmmError {
     MissingBump,
     #[msg("Invalid fee configuration")]
     InvalidFee,
+    #[msg("Pool is paused")]
+    PoolPaused,
 }
