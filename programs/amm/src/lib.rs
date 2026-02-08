@@ -4,6 +4,7 @@ use anchor_spl::token::{self, Burn, Mint, MintTo, Token, TokenAccount, Transfer}
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
 const FEE_BPS: u16 = 30; // 0.3%
+const PROTOCOL_FEE_BPS: u16 = 5; // 0.05% to protocol, rest to LPs
 const BPS_DENOMINATOR: u64 = 10_000;
 
 #[program]
@@ -22,8 +23,26 @@ pub mod amm {
         pool.vault_a = ctx.accounts.vault_a.key();
         pool.vault_b = ctx.accounts.vault_b.key();
         pool.lp_mint = ctx.accounts.lp_mint.key();
+        pool.fee_vault_a = ctx.accounts.fee_vault_a.key();
+        pool.fee_vault_b = ctx.accounts.fee_vault_b.key();
+        pool.admin = ctx.accounts.admin.key();
         pool.bump = *ctx.bumps.get("pool").ok_or(AmmError::MissingBump)?;
         pool.fee_bps = FEE_BPS;
+        pool.protocol_fee_bps = PROTOCOL_FEE_BPS;
+
+        emit!(InitializeEvent {
+            pool: pool.key(),
+            mint_a: pool.mint_a,
+            mint_b: pool.mint_b,
+            lp_mint: pool.lp_mint,
+            vault_a: pool.vault_a,
+            vault_b: pool.vault_b,
+            fee_vault_a: pool.fee_vault_a,
+            fee_vault_b: pool.fee_vault_b,
+            fee_bps: pool.fee_bps,
+            protocol_fee_bps: pool.protocol_fee_bps,
+            admin: pool.admin,
+        });
         Ok(())
     }
 
@@ -39,52 +58,61 @@ pub mod amm {
         let reserve_b = ctx.accounts.vault_b.amount;
         let total_lp = ctx.accounts.lp_mint.supply;
 
-        let lp_to_mint = if total_lp == 0 {
+        let (used_a, used_b, lp_to_mint) = if total_lp == 0 {
             let product = (amount_a as u128)
                 .checked_mul(amount_b as u128)
                 .ok_or(AmmError::MathOverflow)?;
-            integer_sqrt(product)
+            let lp = integer_sqrt(product);
+            (amount_a, amount_b, lp)
         } else {
             require!(reserve_a > 0 && reserve_b > 0, AmmError::InsufficientLiquidity);
 
-            // Enforce proportional deposits to avoid price shifts.
-            let lhs = (amount_a as u128)
+            // Accept imbalanced deposits and mint LP from the limiting side.
+            let ideal_b = (amount_a as u128)
                 .checked_mul(reserve_b as u128)
-                .ok_or(AmmError::MathOverflow)?;
-            let rhs = (amount_b as u128)
-                .checked_mul(reserve_a as u128)
-                .ok_or(AmmError::MathOverflow)?;
-            require!(lhs == rhs, AmmError::NonProportionalDeposit);
-
-            let lp_from_a = (amount_a as u128)
-                .checked_mul(total_lp as u128)
                 .ok_or(AmmError::MathOverflow)?
                 .checked_div(reserve_a as u128)
-                .ok_or(AmmError::MathOverflow)?;
-            let lp_from_b = (amount_b as u128)
-                .checked_mul(total_lp as u128)
-                .ok_or(AmmError::MathOverflow)?
-                .checked_div(reserve_b as u128)
-                .ok_or(AmmError::MathOverflow)?;
-            lp_from_a.min(lp_from_b) as u64
+                .ok_or(AmmError::MathOverflow)? as u64;
+            if amount_b >= ideal_b {
+                let lp = (amount_a as u128)
+                    .checked_mul(total_lp as u128)
+                    .ok_or(AmmError::MathOverflow)?
+                    .checked_div(reserve_a as u128)
+                    .ok_or(AmmError::MathOverflow)? as u64;
+                (amount_a, ideal_b, lp)
+            } else {
+                let ideal_a = (amount_b as u128)
+                    .checked_mul(reserve_a as u128)
+                    .ok_or(AmmError::MathOverflow)?
+                    .checked_div(reserve_b as u128)
+                    .ok_or(AmmError::MathOverflow)? as u64;
+                let lp = (amount_b as u128)
+                    .checked_mul(total_lp as u128)
+                    .ok_or(AmmError::MathOverflow)?
+                    .checked_div(reserve_b as u128)
+                    .ok_or(AmmError::MathOverflow)? as u64;
+                (ideal_a, amount_b, lp)
+            }
         };
 
         require!(lp_to_mint >= min_lp_out, AmmError::SlippageExceeded);
 
-        token::transfer(
-            ctx.accounts.transfer_to_vault_a_ctx(),
-            amount_a,
-        )?;
-        token::transfer(
-            ctx.accounts.transfer_to_vault_b_ctx(),
-            amount_b,
-        )?;
+        token::transfer(ctx.accounts.transfer_to_vault_a_ctx(), used_a)?;
+        token::transfer(ctx.accounts.transfer_to_vault_b_ctx(), used_b)?;
 
         let pool_seeds = ctx.accounts.pool.signer_seeds();
         token::mint_to(
             ctx.accounts.mint_lp_ctx().with_signer(&[&pool_seeds]),
             lp_to_mint,
         )?;
+
+        emit!(DepositEvent {
+            user: ctx.accounts.user.key(),
+            pool: ctx.accounts.pool.key(),
+            amount_a_in: used_a,
+            amount_b_in: used_b,
+            lp_minted: lp_to_mint,
+        });
 
         Ok(())
     }
@@ -128,6 +156,14 @@ pub mod amm {
             amount_b,
         )?;
 
+        emit!(WithdrawEvent {
+            user: ctx.accounts.user.key(),
+            pool: ctx.accounts.pool.key(),
+            lp_burned: lp_amount,
+            amount_a_out: amount_a,
+            amount_b_out: amount_b,
+        });
+
         Ok(())
     }
 
@@ -145,9 +181,22 @@ pub mod amm {
         };
         require!(reserve_in > 0 && reserve_out > 0, AmmError::InsufficientLiquidity);
 
-        let amount_out = quote_swap_out(amount_in, reserve_in, reserve_out)?;
+        let fee_bps = ctx.accounts.pool.fee_bps;
+        let protocol_fee_bps = ctx.accounts.pool.protocol_fee_bps;
+        require!(protocol_fee_bps <= fee_bps, AmmError::InvalidFee);
+
+        let amount_out = quote_swap_out(amount_in, reserve_in, reserve_out, fee_bps)?;
         require!(amount_out >= min_amount_out, AmmError::SlippageExceeded);
         require!(amount_out < reserve_out, AmmError::InsufficientLiquidity);
+
+        let protocol_fee = (amount_in as u128)
+            .checked_mul(protocol_fee_bps as u128)
+            .ok_or(AmmError::MathOverflow)?
+            .checked_div(BPS_DENOMINATOR as u128)
+            .ok_or(AmmError::MathOverflow)? as u64;
+        let amount_in_to_pool = amount_in
+            .checked_sub(protocol_fee)
+            .ok_or(AmmError::MathOverflow)?;
 
         match direction {
             SwapDirection::AtoB => {
@@ -156,7 +205,13 @@ pub mod amm {
                         && ctx.accounts.user_destination.mint == ctx.accounts.mint_b.key(),
                     AmmError::InvalidSwapMint
                 );
-                token::transfer(ctx.accounts.transfer_to_vault_in_ctx(), amount_in)?;
+                token::transfer(ctx.accounts.transfer_to_vault_in_ctx(), amount_in_to_pool)?;
+                if protocol_fee > 0 {
+                    token::transfer(
+                        ctx.accounts.transfer_to_fee_vault_ctx(),
+                        protocol_fee,
+                    )?;
+                }
                 let pool_seeds = ctx.accounts.pool.signer_seeds();
                 token::transfer(
                     ctx.accounts
@@ -171,7 +226,13 @@ pub mod amm {
                         && ctx.accounts.user_destination.mint == ctx.accounts.mint_a.key(),
                     AmmError::InvalidSwapMint
                 );
-                token::transfer(ctx.accounts.transfer_to_vault_in_ctx(), amount_in)?;
+                token::transfer(ctx.accounts.transfer_to_vault_in_ctx(), amount_in_to_pool)?;
+                if protocol_fee > 0 {
+                    token::transfer(
+                        ctx.accounts.transfer_to_fee_vault_ctx(),
+                        protocol_fee,
+                    )?;
+                }
                 let pool_seeds = ctx.accounts.pool.signer_seeds();
                 token::transfer(
                     ctx.accounts
@@ -182,6 +243,63 @@ pub mod amm {
             }
         }
 
+        emit!(SwapEvent {
+            user: ctx.accounts.user.key(),
+            pool: ctx.accounts.pool.key(),
+            amount_in,
+            amount_out,
+            direction,
+            protocol_fee,
+        });
+
+        Ok(())
+    }
+
+    pub fn withdraw_protocol_fees(
+        ctx: Context<WithdrawProtocolFees>,
+        amount_a: u64,
+        amount_b: u64,
+    ) -> Result<()> {
+        require!(amount_a > 0 || amount_b > 0, AmmError::InvalidAmount);
+
+        if amount_a > 0 {
+            require!(
+                ctx.accounts.fee_vault_a.amount >= amount_a,
+                AmmError::InsufficientLiquidity
+            );
+        }
+        if amount_b > 0 {
+            require!(
+                ctx.accounts.fee_vault_b.amount >= amount_b,
+                AmmError::InsufficientLiquidity
+            );
+        }
+
+        let pool_seeds = ctx.accounts.pool.signer_seeds();
+        if amount_a > 0 {
+            token::transfer(
+                ctx.accounts
+                    .transfer_fee_to_admin_a_ctx()
+                    .with_signer(&[&pool_seeds]),
+                amount_a,
+            )?;
+        }
+        if amount_b > 0 {
+            token::transfer(
+                ctx.accounts
+                    .transfer_fee_to_admin_b_ctx()
+                    .with_signer(&[&pool_seeds]),
+                amount_b,
+            )?;
+        }
+
+        emit!(ProtocolFeeWithdrawEvent {
+            admin: ctx.accounts.admin.key(),
+            pool: ctx.accounts.pool.key(),
+            amount_a,
+            amount_b,
+        });
+
         Ok(())
     }
 }
@@ -190,6 +308,8 @@ pub mod amm {
 pub struct Initialize<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
+
+    pub admin: Signer<'info>,
 
     #[account(
         init,
@@ -233,6 +353,26 @@ pub struct Initialize<'info> {
     )]
     pub lp_mint: Account<'info, Mint>,
 
+    #[account(
+        init,
+        payer = payer,
+        token::mint = mint_a,
+        token::authority = pool,
+        seeds = [b"fee_vault_a", pool.key().as_ref()],
+        bump
+    )]
+    pub fee_vault_a: Account<'info, TokenAccount>,
+
+    #[account(
+        init,
+        payer = payer,
+        token::mint = mint_b,
+        token::authority = pool,
+        seeds = [b"fee_vault_b", pool.key().as_ref()],
+        bump
+    )]
+    pub fee_vault_b: Account<'info, TokenAccount>,
+
     pub system_program: Program<'info, System>,
     pub token_program: Program<'info, Token>,
 }
@@ -258,14 +398,16 @@ pub struct DepositLiquidity<'info> {
     #[account(
         mut,
         constraint = vault_a.key() == pool.vault_a,
-        constraint = vault_a.mint == mint_a.key()
+        constraint = vault_a.mint == mint_a.key(),
+        constraint = vault_a.owner == pool.key()
     )]
     pub vault_a: Account<'info, TokenAccount>,
 
     #[account(
         mut,
         constraint = vault_b.key() == pool.vault_b,
-        constraint = vault_b.mint == mint_b.key()
+        constraint = vault_b.mint == mint_b.key(),
+        constraint = vault_b.owner == pool.key()
     )]
     pub vault_b: Account<'info, TokenAccount>,
 
@@ -317,14 +459,16 @@ pub struct WithdrawLiquidity<'info> {
     #[account(
         mut,
         constraint = vault_a.key() == pool.vault_a,
-        constraint = vault_a.mint == mint_a.key()
+        constraint = vault_a.mint == mint_a.key(),
+        constraint = vault_a.owner == pool.key()
     )]
     pub vault_a: Account<'info, TokenAccount>,
 
     #[account(
         mut,
         constraint = vault_b.key() == pool.vault_b,
-        constraint = vault_b.mint == mint_b.key()
+        constraint = vault_b.mint == mint_b.key(),
+        constraint = vault_b.owner == pool.key()
     )]
     pub vault_b: Account<'info, TokenAccount>,
 
@@ -365,7 +509,9 @@ pub struct Swap<'info> {
         has_one = mint_a,
         has_one = mint_b,
         has_one = vault_a,
-        has_one = vault_b
+        has_one = vault_b,
+        has_one = fee_vault_a,
+        has_one = fee_vault_b
     )]
     pub pool: Account<'info, Pool>,
 
@@ -375,16 +521,34 @@ pub struct Swap<'info> {
     #[account(
         mut,
         constraint = vault_a.key() == pool.vault_a,
-        constraint = vault_a.mint == mint_a.key()
+        constraint = vault_a.mint == mint_a.key(),
+        constraint = vault_a.owner == pool.key()
     )]
     pub vault_a: Account<'info, TokenAccount>,
 
     #[account(
         mut,
         constraint = vault_b.key() == pool.vault_b,
-        constraint = vault_b.mint == mint_b.key()
+        constraint = vault_b.mint == mint_b.key(),
+        constraint = vault_b.owner == pool.key()
     )]
     pub vault_b: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = fee_vault_a.key() == pool.fee_vault_a,
+        constraint = fee_vault_a.mint == mint_a.key(),
+        constraint = fee_vault_a.owner == pool.key()
+    )]
+    pub fee_vault_a: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = fee_vault_b.key() == pool.fee_vault_b,
+        constraint = fee_vault_b.mint == mint_b.key(),
+        constraint = fee_vault_b.owner == pool.key()
+    )]
+    pub fee_vault_b: Account<'info, TokenAccount>,
 
     #[account(
         mut,
@@ -401,6 +565,57 @@ pub struct Swap<'info> {
     pub token_program: Program<'info, Token>,
 }
 
+#[derive(Accounts)]
+pub struct WithdrawProtocolFees<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        mut,
+        has_one = mint_a,
+        has_one = mint_b,
+        has_one = fee_vault_a,
+        has_one = fee_vault_b,
+        constraint = pool.admin == admin.key()
+    )]
+    pub pool: Account<'info, Pool>,
+
+    pub mint_a: Account<'info, Mint>,
+    pub mint_b: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        constraint = fee_vault_a.key() == pool.fee_vault_a,
+        constraint = fee_vault_a.mint == mint_a.key(),
+        constraint = fee_vault_a.owner == pool.key()
+    )]
+    pub fee_vault_a: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = fee_vault_b.key() == pool.fee_vault_b,
+        constraint = fee_vault_b.mint == mint_b.key(),
+        constraint = fee_vault_b.owner == pool.key()
+    )]
+    pub fee_vault_b: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = admin_ata_a.owner == admin.key(),
+        constraint = admin_ata_a.mint == mint_a.key()
+    )]
+    pub admin_ata_a: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        constraint = admin_ata_b.owner == admin.key(),
+        constraint = admin_ata_b.mint == mint_b.key()
+    )]
+    pub admin_ata_b: Account<'info, TokenAccount>,
+
+    pub token_program: Program<'info, Token>,
+}
+
 #[account]
 pub struct Pool {
     pub mint_a: Pubkey,
@@ -408,12 +623,16 @@ pub struct Pool {
     pub vault_a: Pubkey,
     pub vault_b: Pubkey,
     pub lp_mint: Pubkey,
+    pub fee_vault_a: Pubkey,
+    pub fee_vault_b: Pubkey,
+    pub admin: Pubkey,
     pub bump: u8,
     pub fee_bps: u16,
+    pub protocol_fee_bps: u16,
 }
 
 impl Pool {
-    pub const LEN: usize = 8 + 32 * 5 + 1 + 2;
+    pub const LEN: usize = 8 + 32 * 8 + 1 + 2 + 2;
 
     pub fn signer_seeds(&self) -> [&[u8]; 4] {
         [
@@ -429,6 +648,57 @@ impl Pool {
 pub enum SwapDirection {
     AtoB,
     BtoA,
+}
+
+#[event]
+pub struct InitializeEvent {
+    pub pool: Pubkey,
+    pub mint_a: Pubkey,
+    pub mint_b: Pubkey,
+    pub lp_mint: Pubkey,
+    pub vault_a: Pubkey,
+    pub vault_b: Pubkey,
+    pub fee_vault_a: Pubkey,
+    pub fee_vault_b: Pubkey,
+    pub fee_bps: u16,
+    pub protocol_fee_bps: u16,
+    pub admin: Pubkey,
+}
+
+#[event]
+pub struct DepositEvent {
+    pub user: Pubkey,
+    pub pool: Pubkey,
+    pub amount_a_in: u64,
+    pub amount_b_in: u64,
+    pub lp_minted: u64,
+}
+
+#[event]
+pub struct WithdrawEvent {
+    pub user: Pubkey,
+    pub pool: Pubkey,
+    pub lp_burned: u64,
+    pub amount_a_out: u64,
+    pub amount_b_out: u64,
+}
+
+#[event]
+pub struct SwapEvent {
+    pub user: Pubkey,
+    pub pool: Pubkey,
+    pub amount_in: u64,
+    pub amount_out: u64,
+    pub direction: SwapDirection,
+    pub protocol_fee: u64,
+}
+
+#[event]
+pub struct ProtocolFeeWithdrawEvent {
+    pub admin: Pubkey,
+    pub pool: Pubkey,
+    pub amount_a: u64,
+    pub amount_b: u64,
 }
 
 impl<'info> DepositLiquidity<'info> {
@@ -545,11 +815,56 @@ impl<'info> Swap<'info> {
             },
         )
     }
+
+    fn transfer_to_fee_vault_ctx(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        let to = if self.user_source.mint == self.mint_a.key() {
+            self.fee_vault_a.to_account_info()
+        } else {
+            self.fee_vault_b.to_account_info()
+        };
+        CpiContext::new(
+            self.token_program.to_account_info(),
+            Transfer {
+                from: self.user_source.to_account_info(),
+                to,
+                authority: self.user.to_account_info(),
+            },
+        )
+    }
 }
 
-fn quote_swap_out(amount_in: u64, reserve_in: u64, reserve_out: u64) -> Result<u64> {
+impl<'info> WithdrawProtocolFees<'info> {
+    fn transfer_fee_to_admin_a_ctx(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        CpiContext::new(
+            self.token_program.to_account_info(),
+            Transfer {
+                from: self.fee_vault_a.to_account_info(),
+                to: self.admin_ata_a.to_account_info(),
+                authority: self.pool.to_account_info(),
+            },
+        )
+    }
+
+    fn transfer_fee_to_admin_b_ctx(&self) -> CpiContext<'_, '_, '_, 'info, Transfer<'info>> {
+        CpiContext::new(
+            self.token_program.to_account_info(),
+            Transfer {
+                from: self.fee_vault_b.to_account_info(),
+                to: self.admin_ata_b.to_account_info(),
+                authority: self.pool.to_account_info(),
+            },
+        )
+    }
+}
+
+fn quote_swap_out(
+    amount_in: u64,
+    reserve_in: u64,
+    reserve_out: u64,
+    fee_bps: u16,
+) -> Result<u64> {
     let amount_in_with_fee = (amount_in as u128)
-        .checked_mul((BPS_DENOMINATOR - FEE_BPS as u64) as u128)
+        .checked_mul((BPS_DENOMINATOR - fee_bps as u64) as u128)
         .ok_or(AmmError::MathOverflow)?
         .checked_div(BPS_DENOMINATOR as u128)
         .ok_or(AmmError::MathOverflow)?;
@@ -598,4 +913,6 @@ pub enum AmmError {
     InvalidSwapMint,
     #[msg("Missing bump")]
     MissingBump,
+    #[msg("Invalid fee configuration")]
+    InvalidFee,
 }
